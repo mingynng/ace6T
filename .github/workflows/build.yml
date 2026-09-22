@@ -1,0 +1,295 @@
+name: Build Kernel for OP-ACE-6T (PLR110 / SM8845)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_branch:
+        description: "KernelSU Next branch (stable=root, none=no root)"
+        required: false
+        default: "next"
+        type: choice
+        options:
+          - "next"
+          - "stable"
+          - "none"
+      manifest_branch:
+        description: "OnePlus kernel manifest branch (留空自动检测最新)"
+        required: false
+        default: ""
+        type: string
+      extra_cmds:
+        description: "额外编译命令 (留空=默认)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    if: github.event.repository.owner.id == github.event.sender.id
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get -y purge \
+            azure-cli \
+            ghc* \
+            zulu* \
+            llvm-* \
+            firefox \
+            google-chrome-stable \
+            powershell \
+            mono-devel || true
+          sudo apt-get -y autoremove
+          sudo apt-get -y clean
+          echo "=== Disk space after cleanup ==="
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            python3 \
+            python3-pip \
+            rsync \
+            cpio \
+            zip \
+            unzip \
+            bc \
+            flex \
+            bison \
+            libssl-dev \
+            libelf-dev \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            lld \
+            jq \
+            device-tree-compiler
+          pip3 install --user gsutil protobuf
+          echo "=== Dependencies installed ==="
+
+      - name: Setup repo tool
+        run: |
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          git config --global user.name "kernel-builder"
+          git config --global user.email "builder@users.noreply.github.com"
+          git config --global color.ui false
+
+      - name: Find manifest branch
+        id: manifest
+        run: |
+          set -e
+          if [ -n "${{ github.event.inputs.manifest_branch }}" ]; then
+            BRANCH="${{ github.event.inputs.manifest_branch }}"
+            echo "Using specified branch: $BRANCH"
+          else
+            # List branches in OnePlusOSS/kernel_manifest and find sm8845 android16
+            echo "Searching for SM8845 android16 branch..."
+            BRANCHES=$(git ls-remote --heads https://github.com/OnePlusOSS/kernel_manifest.git | grep -i "sm8845" | grep -i "16.0" | awk '{print $2}' | sed 's|refs/heads/||' | sort -r)
+            echo "Available branches:"
+            echo "$BRANCHES"
+            BRANCH=$(echo "$BRANCHES" | head -1)
+            if [ -z "$BRANCH" ]; then
+              # Fallback: try any sm8845 branch
+              BRANCH=$(git ls-remote --heads https://github.com/OnePlusOSS/kernel_manifest.git | grep -i "sm8845" | awk '{print $2}' | sed 's|refs/heads/||' | sort -r | head -1)
+            fi
+            if [ -z "$BRANCH" ]; then
+              echo "ERROR: No SM8845 branch found in kernel_manifest"
+              echo "Please specify manifest_branch manually"
+              exit 1
+            fi
+            echo "Auto-detected branch: $BRANCH"
+          fi
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Sync kernel source
+        run: |
+          set -e
+          mkdir -p kernel && cd kernel
+          repo init \
+            -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b "${{ steps.manifest.outputs.branch }}" \
+            --depth=1 \
+            -g default || {
+              echo "repo init failed, trying without depth..."
+              repo init \
+                -u https://github.com/OnePlusOSS/kernel_manifest.git \
+                -b "${{ steps.manifest.outputs.branch }}" \
+                -g default
+            }
+          echo "=== Syncing (this may take a while) ==="
+          repo sync -c --no-clone-bundle --no-tags -j$(nproc)
+          echo "=== Source sync complete ==="
+          ls -la
+
+      - name: Find source directories
+        id: src
+        run: |
+          set -e
+          cd kernel
+          # Find the kernel source directory
+          if [ -d "common" ]; then
+            echo "kernel_dir=common" >> $GITHUB_OUTPUT
+          elif [ -d "kernel/common" ]; then
+            echo "kernel_dir=kernel/common" >> $GITHUB_OUTPUT
+          else
+            # Try to find it
+            KD=$(find . -maxdepth 3 -name "Makefile" -path "*/linux*" | head -1 | xargs dirname)
+            echo "kernel_dir=$KD" >> $GITHUB_OUTPUT
+          fi
+          # Find build config
+          BC=$(find . -maxdepth 4 -name "build.config.msm*" | head -1)
+          echo "build_config=$BC" >> $GITHUB_OUTPUT
+          echo "Kernel dir: $(grep kernel_dir $GITHUB_OUTPUT)"
+          echo "Build config: $(grep build_config $GITHUB_OUTPUT)"
+
+      - name: Apply KernelSU Next
+        if: github.event.inputs.ksu_branch != 'none'
+        run: |
+          set -e
+          cd kernel/${{ steps.src.outputs.kernel_dir }}
+          echo "Applying KernelSU Next (${{ github.event.inputs.ksu_branch }})..."
+          curl -LSs "https://raw.githubusercontent.com/ KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -s -- ${{ github.event.inputs.ksu_branch }} || {
+            echo "KernelSU setup failed, trying without branch..."
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash
+          }
+          echo "KernelSU Next applied"
+
+      - name: Configure kernel
+        run: |
+          set -e
+          cd kernel/${{ steps.src.outputs.kernel_dir }}
+
+          # Enable KernelSU if applied
+          if [ "${{ github.event.inputs.ksu_branch }}" != "none" ]; then
+            scripts/config --file .config \
+              -e CONFIG_KSU \
+              -d CONFIG_KSU_WITH_KPROBES || true
+          fi
+
+          # Enable useful features
+          scripts/config --file .config \
+            -e CONFIG_BPF \
+            -e CONFIG_BPF_SYSCALL \
+            -e CONFIG_NETFILTER \
+            -e CONFIG_NETFILTER_ADVANCED \
+            -e CONFIG_NF_CONNTRACK \
+            -e CONFIG_NETFILTER_XTABLES \
+            -e CONFIG_NETFILTER_XT_TARGET_NAT \
+            -e CONFIG_IP_NF_IPTABLES \
+            -e CONFIG_IP_NF_NAT \
+            -e CONFIG_NF_NAT \
+            -e CONFIG_TCP_CONG_BBR \
+            -d CONFIG_BPF_LSM || true
+
+          echo "=== Kernel config ==="
+          grep -E "CONFIG_(KSU|BPF|BBR|NETFILTER)" .config | head -20
+
+      - name: Build kernel
+        run: |
+          set -e
+          cd kernel
+          echo "=== Starting kernel build ==="
+          echo "CPU cores: $(nproc)"
+          df -h .
+
+          # Try Bazel build first (for 6.12+ GKI kernels)
+          if [ -f "build_with_bazel.py" ]; then
+            echo "Using Bazel build..."
+            python3 build_with_bazel.py --menuconfig -j$(nproc) 2>&1 | tail -100 || {
+              echo "Bazel build failed, trying build.sh..."
+              bash build/build.sh -j$(nproc) 2>&1 | tail -100
+            }
+          elif [ -f "build/build.sh" ]; then
+            echo "Using build.sh..."
+            bash build/build.sh -j$(nproc) 2>&1 | tail -100
+          else
+            echo "Using direct make..."
+            cd ${{ steps.src.outputs.kernel_dir }}
+            make -j$(nproc) O=out ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              LLVM=1 \
+              2>&1 | tail -100
+          fi
+
+          echo "=== Build complete ==="
+
+      - name: Find built kernel image
+        id: image
+        run: |
+          set -e
+          cd kernel
+          # Find the Image file
+          IMG=$(find . -name "Image" -path "*/arch/arm64/boot/*" | head -1)
+          if [ -z "$IMG" ]; then
+            IMG=$(find . -name "Image" | head -1)
+          fi
+          if [ -z "$IMG" ]; then
+            echo "ERROR: No kernel Image found!"
+            find . -name "Image*" -o -name "*.img" | head -20
+            exit 1
+          fi
+          echo "Found kernel: $IMG"
+          echo "image_path=$IMG" >> $GITHUB_OUTPUT
+
+          # Also find dtbo.img if present
+          DTBO=$(find . -name "dtbo.img" | head -1)
+          echo "dtbo_path=$DTBO" >> $GITHUB_OUTPUT
+
+          ls -la "$IMG"
+
+      - name: Package as AnyKernel3 zip
+        run: |
+          set -e
+          cd ${{ github.workspace }}
+
+          # Prepare AnyKernel3
+          mkdir -p AK3
+          cp -r AnyKernel3/* AK3/
+
+          # Copy kernel image
+          cp kernel/${{ steps.image.outputs.image_path }} AK3/Image
+          echo "Kernel Image copied"
+
+          # Copy dtbo if found
+          if [ -n "${{ steps.image.outputs.dtbo_path }}" ]; then
+            cp kernel/${{ steps.image.outputs.dtbo_path }} AK3/dtbo.img
+            echo "DTBO copied"
+          fi
+
+          # Update version
+          KVER=$(strings kernel/${{ steps.image.outputs.image_path }} | grep -m1 "Linux version")
+          echo "Kernel version: $KVER"
+          sed -i "s|kernel.string=.*|kernel.string=OP-ACE-6T Kernel ($KVER)|" AK3/anykernel.sh
+
+          # Create zip
+          cd AK3
+          ZIP_NAME="OP-ACE-6T-SM8845-KernelSU-${{ github.run_number }}.zip"
+          zip -r9 "../$ZIP_NAME" . -x "*.git*"
+          cd ..
+          echo "ZIP created: $ZIP_NAME"
+          ls -lh "$ZIP_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OP-ACE-6T-Kernel
+          path: "*.zip"
+          retention-days: 7
